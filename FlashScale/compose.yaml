@@ -1,0 +1,228 @@
+services:
+  # ==========================================
+  # 🏗️ INFRASTRUCTURE LAYER (Databases & Brokers)
+  # ==========================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: flash-postgres
+    ports:
+      - "5432:5432"
+    networks:
+      - flashnet
+    environment:
+      POSTGRES_USER: postgres_user
+      POSTGRES_PASSWORD: postgres_password
+    volumes:
+      - ./init-dbs.sql:/docker-entrypoint-initdb.d/init-dbs.sql
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres_user"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  mongodb:
+    image: mongo:6
+    container_name: flash-mongo
+    ports:
+      - "27017:27017"
+    networks:
+      - flashnet
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: flash-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - flashnet
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: flash-rabbitmq
+    ports:
+      - "5672:5672"   # AMQP protocol
+      - "15672:15672" # Management UI
+    networks:
+      - flashnet
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+
+  # ==========================================
+  # ⚙️ MICROSERVICES LAYER (Backend)
+  # ==========================================
+  user-service:
+    build:
+      context: ./user-service/
+    container_name: flash-user
+    ports:
+      - "3001:3001"
+    networks:
+      - flashnet
+    environment:
+      - NODE_ENV=development
+      - PORT=3001
+      - JWT_SECRET=nishant1430
+      - JWT_EXPIRES_IN=10h
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=postgres_user
+      - DB_PASSWORD=postgres_password
+      - DB_NAME=flashscale_users
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  product-service:
+    build:
+      context: ./product-service/
+    container_name: flash-product
+    ports:
+      - "3002:3002"
+    networks:
+      - flashnet
+    environment:
+      - NODE_ENV=development
+      - PORT=3002
+      - MONGO_URI=mongodb://mongodb:27017/flashscale_products
+    depends_on:
+      mongodb:
+        condition: service_healthy
+
+  inventory-service:
+    build:
+      context: ./inventory-service/
+    container_name: flash-inventory
+    ports:
+      - "3003:3003"
+    networks:
+      - flashnet
+    environment:
+      - NODE_ENV=development
+      - PORT=3003
+      - REDIS_URL=redis://redis:6379
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=postgres_user
+      - DB_PASSWORD=postgres_password
+      - DB_NAME=flashscale_inventory
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  order-service:
+    build:
+      context: ./order-service/
+    container_name: flash-order
+    ports:
+      - "3004:3004"
+    networks:
+      - flashnet
+    environment:
+      - NODE_ENV=development
+      - PORT=3004
+      - JWT_SECRET=nishant1430
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_USER=postgres_user
+      - DB_PASSWORD=postgres_password
+      - DB_NAME=flashscale_orders
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
+      - ORDER_EVENTS_QUEUE=order_notifications_queue
+      - INVENTORY_SERVICE_URL=http://inventory-service:3003
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      inventory-service:
+        condition: service_started
+
+  notification-service:
+    build:
+      context: ./notification-service/
+    container_name: flash-notification
+    networks:
+      - flashnet
+    environment:
+      - NODE_ENV=development
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672
+      - ORDER_EVENTS_QUEUE=order_notifications_queue
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+  # ==========================================
+  # 🚪 API GATEWAY (The Entry Point)
+  # ==========================================
+  api-gateway:
+    build:
+      context: ./api-gateway/
+    container_name: flash-gateway
+    ports:
+      - "3000:3000"
+    networks:
+      - flashnet
+    environment:
+      - NODE_ENV=development
+      - PORT=3000
+      - HOST=0.0.0.0
+      - JWT_SECRET=nishant1430
+      - USER_SERVICE_URL=http://user-service:3001
+      - PRODUCT_SERVICE_URL=http://product-service:3002
+      - INVENTORY_SERVICE_URL=http://inventory-service:3003
+      - ORDER_SERVICE_URL=http://order-service:3004
+      - RATE_LIMIT_MAX=200
+      - RATE_LIMIT_TIME_WINDOW=1 minute
+    depends_on:
+      - user-service
+      - product-service
+      - inventory-service
+      - order-service
+
+  # ==========================================
+  # 💻 FRONTEND LAYER (React/Vite)
+  # ==========================================
+  frontend:
+    build: 
+      context: ./frontend/
+    container_name: flash-web
+    ports:
+      - "80:80"  # Assuming you used the Nginx Multi-stage Dockerfile
+    networks:
+      - flashnet
+    environment:
+      - VITE_API_GATEWAY_URL=http://localhost:3000 # Client-side execution (browser hits localhost)
+    depends_on:
+      - api-gateway
+
+# ==========================================
+# 💾 PERSISTENT VOLUMES & NETWORKS
+# ==========================================
+volumes:
+  postgres_data:
+  mongodb_data:
+  redis_data:
+
+networks:
+  flashnet:
+    driver: bridge
