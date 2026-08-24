@@ -1,2 +1,2 @@
 # FlashScale
-This is a micro services application..
+This is a micro services application.
